@@ -5,12 +5,15 @@ import tempfile
 import unittest
 import warnings
 import zipfile
+from pathlib import Path
 from unittest.mock import patch
 
 import torch
 import torch.hub as hub
 from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
     IS_SANDCASTLE,
+    parametrize,
     retry,
     run_tests,
     skipIfTorchDynamo,
@@ -29,6 +32,96 @@ SUM_OF_HUB_EXAMPLE = 431080
 TORCHHUB_EXAMPLE_RELEASE_URL = (
     "https://github.com/ailzhang/torchhub_example/releases/download/0.1/mnist_init_ones"
 )
+
+
+class TestHubLocal(TestCase):
+    def setUp(self):
+        super().setUp()
+        self.previous_hub_dir = torch.hub.get_dir()
+        self.tmpdir = tempfile.TemporaryDirectory("hub_dir")
+        torch.hub.set_dir(self.tmpdir.name)
+
+    def tearDown(self):
+        super().tearDown()
+        torch.hub.set_dir(self.previous_hub_dir)
+        self.tmpdir.cleanup()
+
+    @parametrize(
+        "filename",
+        (
+            "weights.pth",
+            "weights-.pth",
+            "weights-0123456.pth",
+            "weights-89ABCDEF.pth",
+        ),
+    )
+    def test_load_state_dict_from_url_rejects_invalid_hash_filename(self, filename):
+        with patch.object(hub, "download_url_to_file") as download:
+            with self.assertRaisesRegex(
+                ValueError, "eight or more lowercase hexadecimal"
+            ):
+                hub.load_state_dict_from_url(
+                    TORCHHUB_EXAMPLE_RELEASE_URL,
+                    check_hash=True,
+                    file_name=filename,
+                )
+        download.assert_not_called()
+
+    def test_load_state_dict_from_url_rejects_hash_mismatch(self):
+        with tempfile.TemporaryDirectory() as source_dir:
+            source = os.path.join(source_dir, "weights-00000000.pth")
+            with open(source, "wb") as f:
+                f.write(b"not a checkpoint")
+
+            with self.assertRaisesRegex(RuntimeError, "invalid hash value"):
+                hub.load_state_dict_from_url(
+                    Path(source).as_uri(),
+                    check_hash=True,
+                    progress=False,
+                )
+
+    def test_load_state_dict_from_url_check_hash_uses_cached_file(self):
+        model_dir = os.path.join(torch.hub.get_dir(), "checkpoints")
+        os.makedirs(model_dir)
+        cached_file = os.path.join(model_dir, "weights.pth")
+        expected = {"weight": torch.ones(1)}
+        torch.save(expected, cached_file)
+
+        with patch.object(hub, "download_url_to_file") as download:
+            result = hub.load_state_dict_from_url(
+                "https://example.com/weights.pth",
+                check_hash=True,
+            )
+
+        self.assertEqual(result, expected)
+        download.assert_not_called()
+
+    @parametrize(
+        "url,file_name,expected_hash",
+        (
+            ("https://example.com/weights-01234567.pth", None, "01234567"),
+            (
+                "https://example.com/weights.pth",
+                "custom-89abcdef.pth",
+                "89abcdef",
+            ),
+        ),
+    )
+    def test_load_state_dict_from_url_uses_hash_from_filename(
+        self, url, file_name, expected_hash
+    ):
+        with (
+            patch.object(hub, "download_url_to_file") as download,
+            patch.object(hub, "_is_legacy_zip_format", return_value=False),
+            patch.object(torch, "load", return_value={}),
+        ):
+            hub.load_state_dict_from_url(
+                url,
+                check_hash=True,
+                file_name=file_name,
+            )
+
+        self.assertEqual(download.call_args.args[2], expected_hash)
 
 
 @unittest.skipIf(IS_SANDCASTLE, "Sandcastle cannot ping external")
@@ -425,6 +518,9 @@ class TestHub(TestCase):
                     hub._safe_extract_zip(cached_zipfile, hub_dir)
 
                 self.assertIn("directory traversal", str(cm.exception))
+
+
+instantiate_parametrized_tests(TestHubLocal)
 
 
 if __name__ == "__main__":
